@@ -19,6 +19,8 @@ def get_file_sha1(file_path):
 PATH_LAUNCHERMETA = './launchermeta' # launchermeta.mojang.com
 PATH_PISTONMETA   = './piston-meta'  # piston-meta.mojang.com
 PATH_LIBRARIES    = './libraries'    # libraries.minecraft.net
+PATH_LAUNCHER     = './launcher'     # launcher.mojang.com
+PATH_PISTONDATA   = './piston-data'  # piston-data.mojang.com
 
 def write_file(path, content, mode, encoding='utf-8'):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -65,6 +67,9 @@ class McMirror:
         # Session
         self.session = requests.Session()
 
+        # Version JSON Paths
+        self.version_json_paths = []
+
         # Manifest Url
         if override_manifest_urls:
             self.manifest_urls = override_manifest_urls
@@ -104,19 +109,52 @@ class McMirror:
         for ver in self.manifest.get('versions', []):
             url = ver['url']
             to = ver['url'].replace('https://piston-meta.mojang.com', PATH_PISTONMETA)
+            self.version_json_paths.append(to)
 
             # Check if exists
             if os.path.exists(to) and get_file_sha1(to) == ver.get('sha1', ''):
-                print('\rSkipped for already exists')
+                # print('Skipped for already exists')
                 self.progbar.add()
                 self.progbar.draw()
                 continue
             
             self.download(url, to)
-            
+
             self.progbar.add()
             self.progbar.draw()
+    
+    def download_baseFiles(self):
+        self.progbar.reset('Download Base Files', 0, 0, len(self.version_json_paths))
+        self.progbar.draw()
+        for path in self.version_json_paths:
+            with open(path, 'r', encoding='utf-8') as f:
+                version_data = json.load(f)
+                asset_index = version_data.get('assetIndex')
+                if asset_index:
+                    url = asset_index['url']
+                    to = url.replace('https://piston-meta.mojang.com', PATH_PISTONMETA)
 
+                    # Check if exists
+                    if os.path.exists(to) and get_file_sha1(to) == asset_index.get('sha1', ''):
+                        # print(f'Skipped downloading as it already exists')
+                        continue
+                    
+                    self.download(url, to)
+            
+                for i in version_data.get('downloads', {}).values():
+                    url = i['url']
+                    to = url.replace('https://launcher.mojang.com', PATH_LAUNCHER)
+                    to = to.replace('https://piston-data.mojang.com', PATH_PISTONDATA)
+
+                    # Check if exists
+                    if os.path.exists(to) and get_file_sha1(to) == i.get('sha1', ''):
+                        # print(f'Skipped downloading as it already exists')
+                        continue
+                    
+                    self.download(url, to)
+
+            self.progbar.add()
+            self.progbar.draw()
 
     def download_all(self):
         # Download version_manifest
@@ -124,6 +162,8 @@ class McMirror:
         
         # Download Version JSONs
         self.download_version_jsons()
+
+        self.download_baseFiles()
 
 
 # Instance
