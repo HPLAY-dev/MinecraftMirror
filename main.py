@@ -5,6 +5,7 @@ import hashlib
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import time
 
 def get_file_sha1(file_path):
     """获取文件的SHA1哈希值"""
@@ -52,9 +53,8 @@ class ProgressBar:
     
     def draw(self):
         with self._lock:
-            # 使用 \r 实现单行刷新
+            # 增加换行控制，避免进度条重叠
             print(f'\r{self.task_name}: {self.get_percentage():.1f}% ({self.current}/{self.maximum})', end='', flush=True)
-
 
 class McMirror:
     def __init__(self, override_manifest_urls: list=None, override_manifest: dict=None, max_workers: int=16, max_retries: int=3):
@@ -67,7 +67,7 @@ class McMirror:
         self.max_workers = max_workers
         self.max_retries = max_retries
 
-        self.tryBMCLAPI = True  # 是否启用 BMCLAPI 镜像加速
+        self.tryBMCLAPI = False  # 是否启用 BMCLAPI 镜像加速
 
         if override_manifest_urls:
             self.manifest_urls = override_manifest_urls
@@ -89,44 +89,38 @@ class McMirror:
         local_path = os.path.join('.', folder_name, parsed_url.path.lstrip('/'))
         return os.path.normpath(local_path)
 
-    def download_single_file(self, url: str, to: str, sha1: str="", timeout=(5, 30), tryBMCLAPI=False) -> bool:
-        """
-        下载单个核心原子操作：包含校验、重试机制
-        """
-        if tryBMCLAPI:
-            replacer = {
-                'https://libraries.minecraft.net/': 'https://bmclapi2.bangbang93.com/maven/',
-                # 'https://maven.neoforged.net/releases/': 'https://bmclapi2.bangbang93.com/maven/',
-                # 'https://maven.minecraftforge.net/': 'https://bmclapi2.bangbang93.com/maven/',
-                # 'https://files.minecraftforge.net/maven': 'https://bmclapi2.bangbang93.com/maven/',
-                # 'https://meta.fabricmc.net': 'https://bmclapi2.bangbang93.com/fabric-meta',
-                'https://launchermeta.mojang.com/': 'https://bmclapi2.bangbang93.com/',
-                'https://launcher.mojang.com/': 'https://bmclapi2.bangbang93.com/',
-                'http://resources.download.minecraft.net/': 'https://bmclapi2.bangbang93.com/assets/',
-                # 'http://dl.liteloader.com/versions/versions.json': 'https://bmclapi.bangbang93.com/maven/com/mumfrey/liteloader/versions.json',
-                # 'https://authlib-injector.yushi.moe': 'https://bmclapi2.bangbang93.com/mirrors/authlib-injector',
-                # 'https://maven.fabricmc.net/': 'https://bmclapi2.bangbang93.com/maven/',
-            } # God bless BMCLAPI
+    def download_single_file(self, url: str, to: str, sha1: str="") -> bool:
+        """优化：带有重试机制的原子下载"""
+        if self.tryBMCLAPI:
+            replacer = {'https://libraries.minecraft.net/': 'https://bmclapi2.bangbang93.com/maven/',
+                        'https://launchermeta.mojang.com/': 'https://bmclapi2.bangbang93.com/',
+                        'http://resources.download.minecraft.net/': 'https://bmclapi2.bangbang93.com/assets/'}
             for k, v in replacer.items():
                 if url.startswith(k):
                     url = url.replace(k, v, 1)
                     break
-        if os.path.exists(to) and sha1 != "" and get_file_sha1(to) == sha1:
-            return True  # 校验通过，跳过下载
 
-        # 下载逻辑
-        try:
-            # 使用流式下载以节省内存
-            with self.session.get(url, timeout=timeout, stream=True) as r:
-                r.raise_for_status()
-                os.makedirs(os.path.dirname(to), exist_ok=True)
-                with open(to, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            # 校验
-            return get_file_sha1(to) == sha1 if sha1 else True
-        except Exception as e:
-            return False
+        # 已存在且校验通过
+        if os.path.exists(to) and (sha1 == "" or get_file_sha1(to) == sha1):
+            return True
+
+        for attempt in range(self.max_retries):
+            try:
+                with self.session.get(url, timeout=(5, 30), stream=True) as r:
+                    r.raise_for_status()
+                    os.makedirs(os.path.dirname(to), exist_ok=True)
+                    with open(to, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                if sha1 == "" or get_file_sha1(to) == sha1:
+                    return True
+            except Exception:
+                for k, v in replacer.items():
+                    if url.startswith(v):
+                        url = url.replace(v, k, 1)
+                        break
+                time.sleep(1) # 失败等待
+        return False
 
     def _execute_thread_pool(self, tasks: list, task_name: str):
         """
@@ -143,7 +137,7 @@ class McMirror:
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # 提交所有任务到线程池
             future_to_task = {
-                executor.submit(self.download_single_file, url, to, sha1, tryBMCLAPI=self.tryBMCLAPI): (url, to) 
+                executor.submit(self.download_single_file, url, to, sha1): (url, to) 
                 for url, to, sha1 in tasks
             }
             
@@ -200,6 +194,41 @@ class McMirror:
 
         # 2. 交付线程池并发下载
         self._execute_thread_pool(tasks, 'Download Base Files')
+    
+    def download_libraries(self):
+        tasks = []
+        for path in self.version_json_paths:
+            if not os.path.exists(path): continue
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for lib in data.get('libraries', []):
+                    downloads = lib.get('downloads', {})
+                    # 优先获取 artifact，同时获取 classifiers
+                    items = [downloads.get('artifact')] + list(downloads.get('classifiers', {}).values())
+                    for item in items:
+                        if item:
+                            tasks.append((item['url'], self.url_to_local_path(item['url']), item.get('sha1', '')))
+        self._execute_thread_pool(list(set(tasks)), 'Download Libraries')
+
+    def download_assets(self):
+        tasks = []
+        for path in self.version_json_paths:
+            if not os.path.exists(path): continue
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                asset_index = data.get('assetIndex', {}).get('url')
+                if not asset_index: continue
+                
+                index_path = self.url_to_local_path(asset_index)
+                if os.path.exists(index_path):
+                    with open(index_path, 'r', encoding='utf-8') as af:
+                        assets = json.load(af).get('objects', {})
+                        for _, info in assets.items():
+                            h = info['hash']
+                            url = f"http://resources.download.minecraft.net/{h[:2]}/{h}"
+                            tasks.append((url, self.url_to_local_path(url), h))
+        
+        self._execute_thread_pool(tasks, 'Download Assets')
 
     def download_all(self):
         manifest_save_url = self.manifest_urls[0]
@@ -212,8 +241,13 @@ class McMirror:
         print() # 换行
         
         self.download_baseFiles()
-        print("\nAll done!")
+        print("")
 
+        self.download_libraries()
+        print("")
+
+        self.download_assets()
+        print("\nAll tasks completed!")
 
 if __name__ == "__main__":
     # 你可以通过调整 max_workers 来改变并发数（推荐 16 ~ 32，根据带宽决定）
