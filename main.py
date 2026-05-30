@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
+import shutil
 
 def get_file_sha1(file_path):
     """获取文件的SHA1哈希值"""
@@ -16,7 +17,7 @@ def get_file_sha1(file_path):
                 sha1_hash.update(chunk)
         return sha1_hash.hexdigest()
     except FileNotFoundError:
-        return ""
+        return "NOTFOUND"
 
 def write_file(path, content, mode, encoding='utf-8'):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -33,6 +34,8 @@ class ProgressBar:
         self.current = current
         self.minimum = minimum
         self.maximum = maximum
+        self.existing = 0  # 已存在文件数
+        self.verified = 0  # 校验通过文件数
         self._lock = threading.Lock()  # 引入线程锁，防止多线程打印错乱
 
     def reset(self, task_name: str=None, current: int=None, minimum: int=None, maximum: int=None):
@@ -41,10 +44,16 @@ class ProgressBar:
             self.current = current if current is not None else self.current
             self.minimum = minimum if minimum is not None else self.minimum
             self.maximum = maximum if maximum is not None else self.maximum
+            self.existing = 0
+            self.verified = 0
     
-    def add(self, delta=1):
+    def add(self, delta=1, existing=False, verified=False):
         with self._lock:
             self.current += delta
+            if existing:
+                self.existing += 1
+            if verified:
+                self.verified += 1
         
     def get_percentage(self):
         if self.minimum >= self.maximum:
@@ -53,8 +62,10 @@ class ProgressBar:
     
     def draw(self):
         with self._lock:
-            # 增加换行控制，避免进度条重叠
-            print(f'\r{self.task_name}: {self.get_percentage():.1f}% ({self.current}/{self.maximum})', end='', flush=True)
+            # 显示进度百分比、总数，以及存在可用和校验通过的数量
+            print(f'\r{self.task_name}: {self.get_percentage():.1f}% ({self.current}/{self.maximum}) '
+                  f'存在可用({self.existing}/{self.current}) '
+                  f'校验通过({self.verified}/{self.current})', end='', flush=True)
 
 class McMirror:
     def __init__(self, override_manifest_urls: list=None, override_manifest: dict=None, max_workers: int=16, max_retries: int=3):
@@ -89,38 +100,62 @@ class McMirror:
         local_path = os.path.join('.', folder_name, parsed_url.path.lstrip('/'))
         return os.path.normpath(local_path)
 
-    def download_single_file(self, url: str, to: str, sha1: str="") -> bool:
-        """优化：带有重试机制的原子下载"""
-        if self.tryBMCLAPI:
-            replacer = {'https://libraries.minecraft.net/': 'https://bmclapi2.bangbang93.com/maven/',
-                        'https://launchermeta.mojang.com/': 'https://bmclapi2.bangbang93.com/',
-                        'http://resources.download.minecraft.net/': 'https://bmclapi2.bangbang93.com/assets/'}
-            for k, v in replacer.items():
-                if url.startswith(k):
-                    url = url.replace(k, v, 1)
-                    break
-
-        # 已存在且校验通过
-        if os.path.exists(to) and (sha1 == "" or get_file_sha1(to) == sha1):
-            return True
-
+    def download_single_file(self, url: str, to: str, sha1: str = "") -> tuple[bool, bool, bool]:
+        """
+        增强版下载函数：
+        - 支持检查 Content-Length
+        - 下载失败详细捕捉
+        - 优化临时文件清理
+        """
+        temp_to = to + ".tmp"
+        
+        # 1. 预检查：如果文件存在且校验通过，直接跳过
+        if os.path.exists(to):
+            if not sha1 or get_file_sha1(to).lower() == sha1.lower():
+                return True, True, True
+            os.remove(to)  # 校验失败，删除旧文件
+    
+        # 2. 核心下载逻辑
         for attempt in range(self.max_retries):
             try:
-                with self.session.get(url, timeout=(5, 30), stream=True) as r:
+                with self.session.get(url, stream=True, timeout=(10, 60)) as r:
                     r.raise_for_status()
+                    
+                    # 获取预期文件大小
+                    expected_size = int(r.headers.get('Content-Length', 0))
+                    
                     os.makedirs(os.path.dirname(to), exist_ok=True)
-                    with open(to, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                if sha1 == "" or get_file_sha1(to) == sha1:
-                    return True
-            except Exception:
-                for k, v in replacer.items():
-                    if url.startswith(v):
-                        url = url.replace(v, k, 1)
-                        break
-                time.sleep(1) # 失败等待
-        return False
+                    with open(temp_to, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=128 * 1024):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    # 3. 校验逻辑
+                    # A. 校验文件大小 (如果服务器提供了)
+                    if expected_size > 0 and os.path.getsize(temp_to) != expected_size:
+                        raise IOError(f"Size mismatch: expected {expected_size}, got {os.path.getsize(temp_to)}")
+                    
+                    # B. 校验 SHA1
+                    if sha1 and get_file_sha1(temp_to).lower() != sha1.lower():
+                        raise ValueError("SHA1 mismatch")
+                    
+                    os.replace(temp_to, to)
+                    return True, False, True
+                    
+            except (requests.RequestException, IOError, ValueError) as e:
+                if os.path.exists(temp_to):
+                    os.remove(temp_to)
+                
+                # 在最后一次尝试失败时输出错误信息，方便调试
+                if attempt == self.max_retries - 1:
+                    # 这里建议记录到日志而非直接print，防止进度条错乱
+                    # print(f"\n[Error] {url} failed: {e}") 
+                    return False, False, False
+                
+                time.sleep(1.5) # 稍微延长重试间隔
+                continue
+                
+        return False, False, False
 
     def _execute_thread_pool(self, tasks: list, task_name: str):
         """
@@ -143,7 +178,13 @@ class McMirror:
             
             # 动态监听任务完成情况，更新进度条
             for future in as_completed(future_to_task):
-                self.progbar.add()
+                url, to = future_to_task[future]
+                try:
+                    success, existing, verified = future.result()
+                    self.progbar.add(existing=existing, verified=verified)
+                except Exception:
+                    # 如果任务抛出异常，仍然更新计数但不标记为存在或校验通过
+                    self.progbar.add()
                 self.progbar.draw()
 
     def get_manifest(self):
@@ -190,7 +231,7 @@ class McMirror:
             
                 # 收集 client/server 等 base 文件
                 for i in version_data.get('downloads', {}).values():
-                    tasks.append((i['url'], self.url_to_local_path(i['url']), i.get('sha1', '')))
+                    tasks.append((i['url'], self.url_to_local_path(i['url']), i['sha1']))
 
         # 2. 交付线程池并发下载
         self._execute_thread_pool(tasks, 'Download Base Files')
@@ -228,7 +269,7 @@ class McMirror:
                             url = f"http://resources.download.minecraft.net/{h[:2]}/{h}"
                             tasks.append((url, self.url_to_local_path(url), h))
         
-        self._execute_thread_pool(tasks, 'Download Assets')
+        self._execute_thread_pool(list(set(tasks)), 'Download Assets')
 
     def download_all(self):
         manifest_save_url = self.manifest_urls[0]
@@ -250,7 +291,7 @@ class McMirror:
         print("\nAll tasks completed!")
 
 if __name__ == "__main__":
-    # 你可以通过调整 max_workers 来改变并发数（推荐 16 ~ 32，根据带宽决定）
+    # 你可以通过调整 max_workers 来改变并发数（推荐 8 ~ 32，根据带宽决定）
     # 通过调整 max_retries 来决定失败重试次数
-    mirror = McMirror(max_workers=32, max_retries=3)
+    mirror = McMirror(max_workers=24, max_retries=3)
     mirror.download_all()
